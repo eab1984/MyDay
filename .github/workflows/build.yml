@@ -1,0 +1,51 @@
+name: Build MyDay
+
+on:
+  schedule:
+    # 5am Eastern = 09:00 UTC (EST) or 10:00 UTC (EDT)
+    # We run at 09:00 UTC year-round; in summer this means 5am EDT,
+    # in winter 4am EST. Adjust if you'd rather have it the other way.
+    - cron: '0 9 * * *'
+  workflow_dispatch:  # Allows manual triggering from the GitHub UI
+  push:
+    branches: [main]  # Rebuild whenever you change the script
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests feedparser
+
+      - name: Generate MyDay page
+        run: python generate.py
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
