@@ -1,6 +1,7 @@
-"""Generate MyDay static HTML page with weather and news."""
+"""Generate MyDay static HTML page with weather, tides, news, currency, and slow reads."""
 import datetime as dt
 import html
+import xml.etree.ElementTree as ET
 import zoneinfo
 from pathlib import Path
 
@@ -9,46 +10,44 @@ import requests
 
 # ---------- Configuration ----------
 LOCATIONS = [
-    {"name": "Palm Harbor, FL", "lat": 28.0781, "lon": -82.7637, "tz": "America/New_York", "unit": "fahrenheit"},
-    {"name": "Cobh, Ireland",   "lat": 51.8508, "lon": -8.2944, "tz": "Europe/Dublin",     "unit": "celsius"},
+    {
+        "name": "Palm Harbor, FL",
+        "lat": 28.0781, "lon": -82.7637,
+        "tz": "America/New_York",
+        "unit": "fahrenheit",
+        "tide_station": "8726724",  # Clearwater Beach
+        "tide_units": "english",
+    },
+    {
+        "name": "Rockport, MA",
+        "lat": 42.6584, "lon": -70.6206,
+        "tz": "America/New_York",
+        "unit": "fahrenheit",
+        "tide_station": "8413320",  # Rockport
+        "tide_units": "english",
+    },
+    {
+        "name": "Cobh, Ireland",
+        "lat": 51.8508, "lon": -8.2944,
+        "tz": "Europe/Dublin",
+        "unit": "celsius",
+        "tide_station": None,  # No NOAA coverage
+    },
 ]
 
 NEWS_FEEDS = [
-    ("BBC",      "https://feeds.bbci.co.uk/news/rss.xml"),
-    ("Guardian", "https://www.theguardian.com/international/rss"),
-    ("FT",       "https://www.ft.com/?format=rss"),
+    ("BBC",         "https://feeds.bbci.co.uk/news/rss.xml"),
+    ("Guardian",    "https://www.theguardian.com/international/rss"),
 ]
 
+# Slow reads — change this URL to swap feeds (LRB, Marginalian, Daily Nous, etc.)
+SLOW_READS = ("Aeon", "https://aeon.co/feed.rss")
+
 HEADLINES_PER_SOURCE = 5
-PAGE_TZ = "America/New_York"  # Timestamp shown at top
+HACKER_NEWS_LIMIT = 5
+SLOW_READS_LIMIT = 3
+PAGE_TZ = "America/New_York"
 # -----------------------------------
-
-
-def fetch_weather(loc):
-    """Fetch today's forecast from Open-Meteo (no API key required)."""
-    url = (
-        "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={loc['lat']}&longitude={loc['lon']}"
-        f"&current=temperature_2m,weather_code"
-        f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code"
-        f"&timezone={loc['tz']}"
-        f"&temperature_unit={loc['unit']}"
-        f"&forecast_days=1"
-    )
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    unit = "°F" if loc["unit"] == "fahrenheit" else "°C"
-    return {
-        "name": loc["name"],
-        "current_temp": round(data["current"]["temperature_2m"]),
-        "current_code": data["current"]["weather_code"],
-        "high": round(data["daily"]["temperature_2m_max"][0]),
-        "low":  round(data["daily"]["temperature_2m_min"][0]),
-        "precip": data["daily"]["precipitation_probability_max"][0],
-        "code": data["daily"]["weather_code"][0],
-        "unit": unit,
-    }
 
 
 # WMO weather codes -> short description
@@ -67,6 +66,67 @@ def describe_weather(code):
     return WEATHER_CODES.get(code, f"Code {code}")
 
 
+def fetch_weather(loc):
+    """Fetch today's forecast plus sunrise/sunset from Open-Meteo."""
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={loc['lat']}&longitude={loc['lon']}"
+        f"&current=temperature_2m,weather_code"
+        f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,sunrise,sunset"
+        f"&timezone={loc['tz']}"
+        f"&temperature_unit={loc['unit']}"
+        f"&forecast_days=1"
+    )
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    unit = "°F" if loc["unit"] == "fahrenheit" else "°C"
+    # Sunrise/sunset come as ISO strings; extract just HH:MM
+    sunrise = data["daily"]["sunrise"][0].split("T")[1][:5]
+    sunset = data["daily"]["sunset"][0].split("T")[1][:5]
+    return {
+        "name": loc["name"],
+        "current_temp": round(data["current"]["temperature_2m"]),
+        "current_code": data["current"]["weather_code"],
+        "high": round(data["daily"]["temperature_2m_max"][0]),
+        "low":  round(data["daily"]["temperature_2m_min"][0]),
+        "precip": data["daily"]["precipitation_probability_max"][0],
+        "code": data["daily"]["weather_code"][0],
+        "unit": unit,
+        "sunrise": sunrise,
+        "sunset": sunset,
+    }
+
+
+def fetch_tides(loc):
+    """Fetch today's high/low tides from NOAA. Returns list of (time, type, height) tuples."""
+    if not loc.get("tide_station"):
+        return None
+    today = dt.datetime.now(zoneinfo.ZoneInfo(loc["tz"])).strftime("%Y%m%d")
+    url = (
+        "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+        f"?product=predictions&application=MyDay"
+        f"&begin_date={today}&end_date={today}"
+        f"&datum=MLLW&station={loc['tide_station']}"
+        f"&time_zone=lst_ldt&units={loc['tide_units']}"
+        f"&interval=hilo&format=json"
+    )
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if "predictions" not in data:
+        return None
+    tides = []
+    for p in data["predictions"]:
+        time_part = p["t"].split(" ")[1][:5]  # "2026-04-25 06:14" -> "06:14"
+        tides.append({
+            "time": time_part,
+            "type": "High" if p["type"] == "H" else "Low",
+            "height": float(p["v"]),
+        })
+    return tides
+
+
 def fetch_news(name, url, limit):
     """Parse an RSS feed, return up to `limit` headlines."""
     feed = feedparser.parse(url)
@@ -79,20 +139,75 @@ def fetch_news(name, url, limit):
     return {"source": name, "items": items}
 
 
-def render_html(weather_blocks, news_blocks):
+def fetch_hacker_news(limit):
+    """Fetch top stories from Hacker News."""
+    top_url = "https://hacker-news.firebaseio.com/v0/topstories.json"
+    ids = requests.get(top_url, timeout=15).json()[:limit]
+    items = []
+    for story_id in ids:
+        item_url = f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json"
+        story = requests.get(item_url, timeout=15).json()
+        if not story:
+            continue
+        # If story has a URL, use it; otherwise link to HN comments
+        link = story.get("url") or f"https://news.ycombinator.com/item?id={story_id}"
+        items.append({
+            "title": story.get("title", "(no title)"),
+            "link": link,
+        })
+    return {"source": "Hacker News", "items": items}
+
+
+def fetch_currency():
+    """Fetch EUR/USD and GBP/USD from ECB daily reference rates."""
+    url = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
+    # ECB publishes rates as EUR -> X. We need to derive EUR/USD and GBP/USD.
+    ns = {"gesmes": "http://www.gesmes.org/xml/2002-08-01",
+          "ecb": "http://www.ecb.int/vocabulary/2002-08-01/eurofxref"}
+    rates = {}
+    for cube in root.findall(".//ecb:Cube[@currency]", ns):
+        rates[cube.attrib["currency"]] = float(cube.attrib["rate"])
+    eur_usd = rates.get("USD")  # 1 EUR = X USD
+    gbp_in_eur = 1.0 / rates["GBP"] if "GBP" in rates else None  # 1 GBP = (1/GBP) EUR
+    gbp_usd = gbp_in_eur * eur_usd if (gbp_in_eur and eur_usd) else None
+    return {"eur_usd": eur_usd, "gbp_usd": gbp_usd}
+
+
+def render_html(weather_blocks, tide_blocks, news_blocks, slow_reads, currency):
     now = dt.datetime.now(zoneinfo.ZoneInfo(PAGE_TZ))
     timestamp = now.strftime("%A %d %B %Y · %H:%M %Z")
 
-    # Weather section
+    # Weather section — combine each location's weather + tides
     weather_html = []
     for w in weather_blocks:
+        # Find tides for this location
+        tide_section = ""
+        loc_tides = tide_blocks.get(w["name"])
+        if loc_tides:
+            tide_lines = " · ".join(
+                f"{t['type']} {t['time']} ({t['height']:.1f}ft)"
+                for t in loc_tides
+            )
+            tide_section = f'<div class="meta tides">🌊 {tide_lines}</div>'
+
         weather_html.append(f"""
         <div class="weather-card">
           <h3>{html.escape(w['name'])}</h3>
           <div class="temp">{w['current_temp']}{w['unit']} <span class="cond">{html.escape(describe_weather(w['current_code']))}</span></div>
           <div class="meta">High {w['high']}{w['unit']} · Low {w['low']}{w['unit']} · Rain {w['precip']}%</div>
-          <div class="meta">Today: {html.escape(describe_weather(w['code']))}</div>
+          <div class="meta">☀ {w['sunrise']} → {w['sunset']} · Today: {html.escape(describe_weather(w['code']))}</div>
+          {tide_section}
         </div>""")
+
+    # Currency
+    currency_html = ""
+    if currency.get("eur_usd"):
+        eur = f"€1 = ${currency['eur_usd']:.4f}"
+        gbp = f"£1 = ${currency['gbp_usd']:.4f}" if currency.get("gbp_usd") else ""
+        currency_html = f'<div class="currency">{eur} &nbsp;·&nbsp; {gbp}</div>'
 
     # News section
     news_html = []
@@ -106,6 +221,20 @@ def render_html(weather_blocks, news_blocks):
           <h3>{html.escape(block['source'])}</h3>
           <ul>{items}</ul>
         </section>""")
+
+    # Slow reads
+    slow_html = ""
+    if slow_reads:
+        items = "".join(
+            f'<li><a href="{html.escape(item["link"])}" target="_blank" rel="noopener">{html.escape(item["title"])}</a></li>'
+            for item in slow_reads["items"]
+        )
+        slow_html = f"""
+        <h2>Slow Reads</h2>
+        <section class="news-source">
+          <h3>{html.escape(slow_reads['source'])}</h3>
+          <ul>{items}</ul>
+        </section>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -131,12 +260,14 @@ def render_html(weather_blocks, news_blocks):
   h2 {{ font-size: 1.2rem; margin: 1.5rem 0 0.75rem; border-bottom: 1px solid var(--border); padding-bottom: 0.25rem; }}
   h3 {{ font-size: 1rem; margin: 0 0 0.5rem; color: var(--accent); }}
   .timestamp {{ color: var(--muted); font-size: 0.9rem; margin-bottom: 1rem; }}
+  .currency {{ font-size: 0.95rem; margin-bottom: 1rem; padding: 0.5rem 0.75rem; background: var(--card); border: 1px solid var(--border); border-radius: 6px; }}
   .weather-grid {{ display: grid; gap: 0.75rem; grid-template-columns: 1fr; }}
-  @media (min-width: 500px) {{ .weather-grid {{ grid-template-columns: 1fr 1fr; }} }}
+  @media (min-width: 600px) {{ .weather-grid {{ grid-template-columns: 1fr 1fr; }} }}
   .weather-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 0.75rem; }}
   .temp {{ font-size: 1.5rem; font-weight: 600; }}
   .cond {{ font-size: 1rem; font-weight: 400; color: var(--muted); }}
   .meta {{ font-size: 0.85rem; color: var(--muted); }}
+  .tides {{ margin-top: 0.25rem; }}
   .news-source {{ margin-bottom: 1.25rem; }}
   ul {{ margin: 0; padding-left: 1.25rem; }}
   li {{ margin-bottom: 0.4rem; }}
@@ -147,12 +278,14 @@ def render_html(weather_blocks, news_blocks):
 <body>
   <h1>MyDay</h1>
   <div class="timestamp">Generated {html.escape(timestamp)}</div>
+  {currency_html}
 
-  <h2>Weather</h2>
+  <h2>Weather &amp; Tides</h2>
   <div class="weather-grid">{''.join(weather_html)}</div>
 
   <h2>News</h2>
   {''.join(news_html)}
+  {slow_html}
 </body>
 </html>
 """
@@ -160,11 +293,18 @@ def render_html(weather_blocks, news_blocks):
 
 def main():
     weather = []
+    tides = {}
     for loc in LOCATIONS:
         try:
             weather.append(fetch_weather(loc))
         except Exception as e:
             print(f"Weather failed for {loc['name']}: {e}")
+        try:
+            t = fetch_tides(loc)
+            if t:
+                tides[loc["name"]] = t
+        except Exception as e:
+            print(f"Tides failed for {loc['name']}: {e}")
 
     news = []
     for name, url in NEWS_FEEDS:
@@ -173,7 +313,27 @@ def main():
         except Exception as e:
             print(f"News failed for {name}: {e}")
 
-    Path("index.html").write_text(render_html(weather, news), encoding="utf-8")
+    try:
+        news.append(fetch_hacker_news(HACKER_NEWS_LIMIT))
+    except Exception as e:
+        print(f"Hacker News failed: {e}")
+
+    slow = None
+    try:
+        slow = fetch_news(SLOW_READS[0], SLOW_READS[1], SLOW_READS_LIMIT)
+    except Exception as e:
+        print(f"Slow reads failed: {e}")
+
+    currency = {}
+    try:
+        currency = fetch_currency()
+    except Exception as e:
+        print(f"Currency failed: {e}")
+
+    Path("index.html").write_text(
+        render_html(weather, tides, news, slow, currency),
+        encoding="utf-8"
+    )
     print("Wrote index.html")
 
 
