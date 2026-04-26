@@ -176,9 +176,34 @@ def fetch_currency():
     return {"eur_usd": eur_usd, "gbp_usd": gbp_usd}
 
 
+def moon_phase(date):
+    """Return (phase_name, emoji) for the given date using synodic period approximation."""
+    known_new = dt.date(2000, 1, 6)
+    phase = ((date - known_new).days % 29.53058867) / 29.53058867
+    if phase < 0.03 or phase >= 0.97:
+        return "New Moon", "🌑"
+    elif phase < 0.25:
+        return "Waxing Crescent", "🌒"
+    elif phase < 0.27:
+        return "First Quarter", "🌓"
+    elif phase < 0.50:
+        return "Waxing Gibbous", "🌔"
+    elif phase < 0.53:
+        return "Full Moon", "🌕"
+    elif phase < 0.75:
+        return "Waning Gibbous", "🌖"
+    elif phase < 0.77:
+        return "Last Quarter", "🌗"
+    else:
+        return "Waning Crescent", "🌘"
+
+
 def render_html(weather_blocks, tide_blocks, news_blocks, slow_reads, currency):
     now = dt.datetime.now(zoneinfo.ZoneInfo(PAGE_TZ))
     timestamp = now.strftime("%A %d %B %Y · %H:%M %Z")
+    day_of_year = now.timetuple().tm_yday
+    week_of_year = now.isocalendar()[1]
+    moon_name, moon_emoji = moon_phase(now.date())
 
     # Weather section — combine each location's weather + tides
     weather_html = []
@@ -278,6 +303,7 @@ def render_html(weather_blocks, tide_blocks, news_blocks, slow_reads, currency):
 <body>
   <h1>MyDay</h1>
   <div class="timestamp">Generated {html.escape(timestamp)}</div>
+  <div class="timestamp">Day {day_of_year} · Week {week_of_year} · {moon_emoji} {html.escape(moon_name)}</div>
   {currency_html}
 
   <h2>Weather &amp; Tides</h2>
