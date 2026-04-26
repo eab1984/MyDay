@@ -1,4 +1,5 @@
 """Generate MyDay static HTML page with weather, tides, news, currency, and slow reads."""
+import concurrent.futures
 import datetime as dt
 import html
 import xml.etree.ElementTree as ET
@@ -49,6 +50,9 @@ SLOW_READS_LIMIT = 3
 PAGE_TZ = "America/New_York"
 # -----------------------------------
 
+# Global session to pool HTTP connections
+session = requests.Session()
+
 
 # WMO weather codes -> short description
 WEATHER_CODES = {
@@ -71,13 +75,13 @@ def fetch_weather(loc):
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={loc['lat']}&longitude={loc['lon']}"
-        f"&current=temperature_2m,weather_code"
-        f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,sunrise,sunset"
+        f"&current=temperature_2m,weather_code,wind_speed_10m"
+        f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,sunrise,sunset,uv_index_max"
         f"&timezone={loc['tz']}"
         f"&temperature_unit={loc['unit']}"
         f"&forecast_days=1"
     )
-    r = requests.get(url, timeout=15)
+    r = session.get(url, timeout=15)
     r.raise_for_status()
     data = r.json()
     unit = "°F" if loc["unit"] == "fahrenheit" else "°C"
@@ -88,6 +92,7 @@ def fetch_weather(loc):
         "name": loc["name"],
         "current_temp": round(data["current"]["temperature_2m"]),
         "current_code": data["current"]["weather_code"],
+        "wind_speed": round(data["current"]["wind_speed_10m"]),
         "high": round(data["daily"]["temperature_2m_max"][0]),
         "low":  round(data["daily"]["temperature_2m_min"][0]),
         "precip": data["daily"]["precipitation_probability_max"][0],
@@ -95,6 +100,7 @@ def fetch_weather(loc):
         "unit": unit,
         "sunrise": sunrise,
         "sunset": sunset,
+        "uv_index": round(data["daily"]["uv_index_max"][0]),
     }
 
 
@@ -111,7 +117,7 @@ def fetch_tides(loc):
         f"&time_zone=lst_ldt&units={loc['tide_units']}"
         f"&interval=hilo&format=json"
     )
-    r = requests.get(url, timeout=15)
+    r = session.get(url, timeout=15)
     r.raise_for_status()
     data = r.json()
     if "predictions" not in data:
@@ -142,26 +148,29 @@ def fetch_news(name, url, limit):
 def fetch_hacker_news(limit):
     """Fetch top stories from Hacker News."""
     top_url = "https://hacker-news.firebaseio.com/v0/topstories.json"
-    ids = requests.get(top_url, timeout=15).json()[:limit]
+    ids = session.get(top_url, timeout=15).json()[:limit]
     items = []
-    for story_id in ids:
+
+    def get_story(story_id):
         item_url = f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json"
-        story = requests.get(item_url, timeout=15).json()
-        if not story:
-            continue
-        # If story has a URL, use it; otherwise link to HN comments
-        link = story.get("url") or f"https://news.ycombinator.com/item?id={story_id}"
-        items.append({
-            "title": story.get("title", "(no title)"),
-            "link": link,
-        })
+        return story_id, session.get(item_url, timeout=15).json()
+
+    # Fetch individual story details in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=limit) as executor:
+        results = executor.map(get_story, ids)
+
+    for story_id, story in results:
+        if story:
+            link = story.get("url") or f"https://news.ycombinator.com/item?id={story_id}"
+            items.append({"title": story.get("title", "(no title)"), "link": link})
+
     return {"source": "Hacker News", "items": items}
 
 
 def fetch_currency():
     """Fetch EUR/USD and GBP/USD from ECB daily reference rates."""
     url = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
-    r = requests.get(url, timeout=15)
+    r = session.get(url, timeout=15)
     r.raise_for_status()
     root = ET.fromstring(r.content)
     # ECB publishes rates as EUR -> X. We need to derive EUR/USD and GBP/USD.
@@ -174,6 +183,34 @@ def fetch_currency():
     gbp_in_eur = 1.0 / rates["GBP"] if "GBP" in rates else None  # 1 GBP = (1/GBP) EUR
     gbp_usd = gbp_in_eur * eur_usd if (gbp_in_eur and eur_usd) else None
     return {"eur_usd": eur_usd, "gbp_usd": gbp_usd}
+
+
+def fetch_quote():
+    """Fetch Quote of the Day from ZenQuotes."""
+    url = "https://zenquotes.io/api/today"
+    r = session.get(url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data and isinstance(data, list):
+        return {"quote": data[0].get("q"), "author": data[0].get("a")}
+    return None
+
+
+def fetch_on_this_day(limit=3):
+    """Fetch historical events for today from Wikipedia."""
+    now = dt.datetime.now(zoneinfo.ZoneInfo(PAGE_TZ))
+    url = f"https://en.wikipedia.org/api/rest_v1/feed/onthisday/events/{now.month:02d}/{now.day:02d}"
+    # Wikipedia requires a descriptive User-Agent header
+    headers = {"User-Agent": "MyDayDashboard/1.0"}
+    r = session.get(url, headers=headers, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    events = []
+    for event in data.get("events", [])[:limit]:
+        year = event.get("year")
+        text = event.get("text")
+        events.append({"year": year, "text": text})
+    return events
 
 
 def moon_phase(date):
@@ -198,7 +235,7 @@ def moon_phase(date):
         return "Waning Crescent", "🌘"
 
 
-def render_html(weather_blocks, tide_blocks, news_blocks, slow_reads, currency):
+def render_html(weather_blocks, tide_blocks, news_blocks, slow_reads, currency, quote, history):
     now = dt.datetime.now(zoneinfo.ZoneInfo(PAGE_TZ))
     timestamp = now.strftime("%A %d %B %Y · %H:%M %Z")
     day_of_year = now.timetuple().tm_yday
@@ -222,7 +259,8 @@ def render_html(weather_blocks, tide_blocks, news_blocks, slow_reads, currency):
         <div class="weather-card">
           <h3>{html.escape(w['name'])}</h3>
           <div class="temp">{w['current_temp']}{w['unit']} <span class="cond">{html.escape(describe_weather(w['current_code']))}</span></div>
-          <div class="meta">High {w['high']}{w['unit']} · Low {w['low']}{w['unit']} · Rain {w['precip']}%</div>
+          <div class="meta">High {w['high']}{w['unit']} · Low {w['low']}{w['unit']} · Rain {w['precip']}% · UV {w['uv_index']}</div>
+          <div class="meta">Wind {w['wind_speed']} { 'mph' if w['unit'] == '°F' else 'km/h' }</div>
           <div class="meta">☀ {w['sunrise']} → {w['sunset']} · Today: {html.escape(describe_weather(w['code']))}</div>
           {tide_section}
         </div>""")
@@ -260,6 +298,25 @@ def render_html(weather_blocks, tide_blocks, news_blocks, slow_reads, currency):
           <h3>{html.escape(slow_reads['source'])}</h3>
           <ul>{items}</ul>
         </section>"""
+
+    # Quote of the Day
+    quote_html = ""
+    if quote:
+        quote_html = f"""
+        <h2>Quote of the Day</h2>
+        <blockquote style="margin: 0; padding-left: 1rem; border-left: 4px solid var(--accent); font-style: italic;">
+          "{html.escape(quote['quote'])}" <br>
+          <small>&mdash; {html.escape(quote['author'])}</small>
+        </blockquote>"""
+
+    # On This Day
+    history_html = ""
+    if history:
+        items = "".join(
+            f'<li><strong>{item["year"]}:</strong> {html.escape(item["text"])}</li>'
+            for item in history
+        )
+        history_html = f"<h2>On This Day</h2><ul>{items}</ul>"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -312,6 +369,9 @@ def render_html(weather_blocks, tide_blocks, news_blocks, slow_reads, currency):
   <h2>News</h2>
   {''.join(news_html)}
   {slow_html}
+  
+  {quote_html}
+  {history_html}
 </body>
 </html>
 """
@@ -320,44 +380,61 @@ def render_html(weather_blocks, tide_blocks, news_blocks, slow_reads, currency):
 def main():
     weather = []
     tides = {}
-    for loc in LOCATIONS:
-        try:
-            weather.append(fetch_weather(loc))
-        except Exception as e:
-            print(f"Weather failed for {loc['name']}: {e}")
-        try:
-            t = fetch_tides(loc)
-            if t:
-                tides[loc["name"]] = t
-        except Exception as e:
-            print(f"Tides failed for {loc['name']}: {e}")
-
     news = []
-    for name, url in NEWS_FEEDS:
-        try:
-            news.append(fetch_news(name, url, HEADLINES_PER_SOURCE))
-        except Exception as e:
-            print(f"News failed for {name}: {e}")
-
-    try:
-        news.append(fetch_hacker_news(HACKER_NEWS_LIMIT))
-    except Exception as e:
-        print(f"Hacker News failed: {e}")
-
     slow = None
-    try:
-        slow = fetch_news(SLOW_READS[0], SLOW_READS[1], SLOW_READS_LIMIT)
-    except Exception as e:
-        print(f"Slow reads failed: {e}")
-
     currency = {}
-    try:
-        currency = fetch_currency()
-    except Exception as e:
-        print(f"Currency failed: {e}")
+    quote = None
+    history = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # Submit all network tasks concurrently
+        weather_futures = {executor.submit(fetch_weather, loc): loc for loc in LOCATIONS}
+        tide_futures = {executor.submit(fetch_tides, loc): loc for loc in LOCATIONS}
+        news_futures = [executor.submit(fetch_news, name, url, HEADLINES_PER_SOURCE) for name, url in NEWS_FEEDS]
+        hn_future = executor.submit(fetch_hacker_news, HACKER_NEWS_LIMIT)
+        slow_future = executor.submit(fetch_news, SLOW_READS[0], SLOW_READS[1], SLOW_READS_LIMIT)
+        currency_future = executor.submit(fetch_currency)
+        quote_future = executor.submit(fetch_quote)
+        history_future = executor.submit(fetch_on_this_day, 3)
+
+        # Collect results (iteration blocks until ready, preserving your original layout order)
+        for future in weather_futures:
+            loc = weather_futures[future]
+            try:
+                weather.append(future.result())
+            except Exception as e:
+                print(f"Weather failed for {loc['name']}: {e}")
+
+        for future in tide_futures:
+            loc = tide_futures[future]
+            try:
+                t = future.result()
+                if t:
+                    tides[loc["name"]] = t
+            except Exception as e:
+                print(f"Tides failed for {loc['name']}: {e}")
+
+        for future in news_futures:
+            try: news.append(future.result())
+            except Exception as e: print(f"News failed: {e}")
+
+        try: news.append(hn_future.result())
+        except Exception as e: print(f"Hacker News failed: {e}")
+
+        try: slow = slow_future.result()
+        except Exception as e: print(f"Slow reads failed: {e}")
+
+        try: currency = currency_future.result()
+        except Exception as e: print(f"Currency failed: {e}")
+
+        try: quote = quote_future.result()
+        except Exception as e: print(f"Quote failed: {e}")
+
+        try: history = history_future.result()
+        except Exception as e: print(f"History failed: {e}")
 
     Path("index.html").write_text(
-        render_html(weather, tides, news, slow, currency),
+        render_html(weather, tides, news, slow, currency, quote, history),
         encoding="utf-8"
     )
     print("Wrote index.html")
